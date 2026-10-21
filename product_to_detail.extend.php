@@ -1,32 +1,24 @@
 <?php
 /**
- * GNUboard5: product 게시판 JSON -> pr_detail 자동 등록
+ * GNUboard5: product 게시판 -> pr_detail 자동 등록
  *
  * 파일: /extend/product_to_detail.extend.php
  *
- * 요청 및 처리:
- *   POST /api/v1/boards/product/posts (인증 필요)
- *   요청 본문의 wr_content에 상품 JSON을 넣어 product 게시글을 신규 등록합니다.
- *   저장 후 이 확장 기능이 JSON에서 상품명을 읽어 pr_detail 글 1건을 생성합니다.
- *   product 게시글 수정과 답글은 pr_detail 생성 대상이 아닙니다.
+ * 원본 게시글:
+ *   product.wr_subject = 고유 상품코드
+ *   product.wr_content = 상품명 및 상품 내용이 포함된 JSON
  *
- * API 응답:
- *   data.product_to_detail.status = created       - pr_detail 신규 생성, target_wr_id 포함
- *   data.product_to_detail.status = duplicate     - 동일한 제목이 이미 존재함, 기존 target_wr_id 포함
- *   data.product_to_detail.status = failed        - pr_detail 생성 실패
- *   data.product_to_detail.status = skipped       - 답글이라 처리하지 않음
- *   data.product_to_detail.status = not_available - 처리 상태를 확인할 확장 기능이 실행되지 않음
+ * 대상 게시글:
+ *   pr_detail.wr_subject = 원본 고유 상품코드 그대로
+ *   pr_detail.wr_content = 원본 JSON 그대로
  *
- * 원본:
- *   product.wr_content = JSON
+ * 처리:
+ *   - product 게시판의 신규 글만 처리
+ *   - pr_detail.wr_subject에 동일한 상품코드가 있으면 신규 글 생성 안 함
+ *   - wr_1, wr_2는 사용하지 않음
  *
- * 대상:
- *   pr_detail.wr_subject = JSON의 상품명 원본값
- *   pr_detail.wr_content = 원본 JSON
- *
- * 참고:
- *   wr_1, wr_2 필드는 사용하지 않습니다.
- *   제목이 이미 존재하면 새 글을 생성하지 않습니다.
+ * API 응답 연동 시 사용할 수 있는 상태:
+ *   created, duplicate, failed, skipped
  */
 
 if (!defined('_GNUBOARD_')) {
@@ -34,7 +26,6 @@ if (!defined('_GNUBOARD_')) {
 }
 
 if (!function_exists('product_to_detail_after_write')) {
-
     add_event(
         'write_update_after',
         'product_to_detail_after_write',
@@ -43,7 +34,7 @@ if (!function_exists('product_to_detail_after_write')) {
     );
 
     /**
-     * 게시글 저장 후 실행
+     * product 게시글 저장 후 실행되는 이벤트 콜백
      */
     function product_to_detail_after_write(
         $board,
@@ -52,7 +43,6 @@ if (!function_exists('product_to_detail_after_write')) {
         $qstr,
         $redirect_url
     ) {
-        // product 게시판만 처리
         if (($board['bo_table'] ?? '') !== 'product') {
             return;
         }
@@ -72,19 +62,18 @@ if (!function_exists('product_to_detail_after_write')) {
             ];
 
             error_log(
-                '[product_to_detail] ' .
-                'source_wr_id=' . (int)$wr_id .
-                ' error=' . $e->getMessage()
+                '[product_to_detail] source_wr_id=' .
+                (int)$wr_id . ' error=' . $e->getMessage()
             );
         }
     }
 
     /**
-     * 원본 JSON을 읽고 pr_detail 게시글 생성
+     * 원본 상품 게시글을 확인하고 pr_detail 게시글 생성
      */
     function product_to_detail_create_post($source_wr_id)
     {
-        global $g5, $config;
+        global $g5;
 
         if ($source_wr_id < 1) {
             throw new \RuntimeException('Invalid source wr_id');
@@ -93,9 +82,9 @@ if (!function_exists('product_to_detail_after_write')) {
         $source_table = $g5['write_prefix'] . 'product';
         $target_table = $g5['write_prefix'] . 'pr_detail';
 
-        // 대상 게시판이 실제로 존재하는지 확인
+        // 대상 게시판 존재 여부 확인
         $target_board = sql_fetch("
-            SELECT bo_table, bo_subject
+            SELECT bo_table
             FROM {$g5['board_table']}
             WHERE bo_table = 'pr_detail'
             LIMIT 1
@@ -107,7 +96,7 @@ if (!function_exists('product_to_detail_after_write')) {
             );
         }
 
-        // 원본 상품 게시글 조회
+        // 원본 글 조회: wr_subject는 고유 상품코드, wr_content는 JSON
         $source = sql_fetch("
             SELECT *
             FROM {$source_table}
@@ -121,45 +110,27 @@ if (!function_exists('product_to_detail_after_write')) {
             );
         }
 
-        $json = $source['wr_content'] ?? '';
+        // 고유 상품코드를 원본값 그대로 사용
+        $product_code = (string)($source['wr_subject'] ?? '');
 
-        if (!is_string($json) || trim($json) === '') {
+        if ($product_code === '') {
             throw new \RuntimeException(
-                'Source wr_content is empty'
+                'Source wr_subject (product code) is empty'
             );
         }
 
-        // 게시글 내용은 JSON 객체여야 함
-        $data = json_decode($json, true);
+        // JSON은 유효성만 검사하고 저장할 때는 원본 문자열 그대로 사용
+        $json = (string)($source['wr_content'] ?? '');
 
-        if (
-            json_last_error() !== JSON_ERROR_NONE ||
-            !is_array($data)
-        ) {
+        if ($json === '') {
+            throw new \RuntimeException('Source wr_content is empty');
+        }
+
+        json_decode($json, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
             throw new \RuntimeException(
                 'Invalid product JSON: ' . json_last_error_msg()
-            );
-        }
-
-        // 상품명 원본값 추출: trim/cut_str 등으로 가공하지 않음
-        $product_name = '';
-
-        foreach (['name', 'it_name', 'product_name', 'title'] as $key) {
-            if (isset($data[$key]) && is_string($data[$key]) && $data[$key] !== '') {
-                $product_name = $data[$key];
-                break;
-            }
-        }
-
-        if ($product_name === '') {
-            throw new \RuntimeException(
-                'Product name is missing from JSON'
-            );
-        }
-
-        if (mb_strlen($product_name, 'UTF-8') > 255) {
-            throw new \RuntimeException(
-                'Product name exceeds 255 characters'
             );
         }
 
@@ -169,8 +140,8 @@ if (!function_exists('product_to_detail_after_write')) {
             );
         }
 
-        // wr_subject에 저장할 원본 상품명 값으로 중복 확인
-        $subject_sql = sql_real_escape_string($product_name);
+        // 동일한 상품코드가 pr_detail에 있으면 신규 등록하지 않음
+        $subject_sql = sql_real_escape_string($product_code);
 
         $existing = sql_fetch("
             SELECT wr_id
@@ -186,14 +157,13 @@ if (!function_exists('product_to_detail_after_write')) {
             ];
         }
 
+        // SQL 저장을 위해 이스케이프만 수행; DB에는 원본 문자열이 저장됨
         $content_sql = sql_real_escape_string($json);
-
         $mb_id = sql_real_escape_string(
             (string)($source['mb_id'] ?? '')
         );
 
-        $wr_name = trim((string)($source['wr_name'] ?? ''));
-
+        $wr_name = (string)($source['wr_name'] ?? '');
         if ($wr_name === '') {
             $wr_name = '상품 자동등록';
         }
@@ -201,31 +171,26 @@ if (!function_exists('product_to_detail_after_write')) {
         $wr_name_sql = sql_real_escape_string(
             mb_substr($wr_name, 0, 255, 'UTF-8')
         );
-
         $wr_email_sql = sql_real_escape_string(
             (string)($source['wr_email'] ?? '')
         );
-
         $wr_homepage_sql = sql_real_escape_string(
             (string)($source['wr_homepage'] ?? '')
         );
-
         $wr_ip_sql = sql_real_escape_string(
             (string)($source['wr_ip'] ?? '')
         );
-
         $now_sql = sql_real_escape_string(G5_TIME_YMDHIS);
 
-        // GNUboard 게시글 번호 규칙
+        // GNUboard 게시글 번호
         $num_row = sql_fetch("
             SELECT IFNULL(MIN(wr_num) - 1, -1) AS wr_num
             FROM {$target_table}
         ");
-
         $wr_num = (int)($num_row['wr_num'] ?? -1);
 
-        // 게시글 생성: 상품명 원본값과 원본 JSON 저장
-        // wr_1, wr_2는 사용하지 않음
+        // 상품코드는 wr_subject에, 원본 JSON은 wr_content에 그대로 저장
+        // wr_1, wr_2 필드는 사용하지 않음
         $insert_sql = "
             INSERT INTO {$target_table}
             SET
@@ -276,13 +241,11 @@ if (!function_exists('product_to_detail_after_write')) {
         ");
 
         // 새 글 테이블 갱신
-        $board_table = sql_real_escape_string('pr_detail');
-
         sql_query("
             INSERT INTO {$g5['board_new_table']}
                 (bo_table, wr_id, wr_parent, bn_datetime, mb_id)
             VALUES (
-                '{$board_table}',
+                'pr_detail',
                 '{$target_wr_id}',
                 '{$target_wr_id}',
                 '{$now_sql}',
@@ -290,18 +253,16 @@ if (!function_exists('product_to_detail_after_write')) {
             )
         ");
 
-        // 대상 게시판의 글 수 증가
+        // 게시판 글 수 증가
         sql_query("
             UPDATE {$g5['board_table']}
             SET bo_count_write = bo_count_write + 1
             WHERE bo_table = 'pr_detail'
         ");
 
-        // 처리 결과 기록
         error_log(
-            '[product_to_detail] created ' .
-            'source_wr_id=' . $source_wr_id .
-            ' target_wr_id=' . $target_wr_id
+            '[product_to_detail] created source_wr_id=' .
+            $source_wr_id . ' target_wr_id=' . $target_wr_id
         );
 
         return [
